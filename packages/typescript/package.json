@@ -1,0 +1,34 @@
+{
+  "name": "omniharness",
+  "version": "0.1.0",
+  "description": "Unified TypeScript SDK over managed coding-agent services",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@cursor/sdk": ">=1.0.10"
+  },
+  "peerDependenciesMeta": {
+    "@cursor/sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "tsup": "^8",
+    "vitest": "^1",
+    "msw": "^2",
+    "typescript": "^5.4",
+    "@types/node": "^20"
+  }
+}
