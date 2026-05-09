@@ -70,7 +70,7 @@ class JulesV1AlphaProvider:
         return resp
 
     def _to_session(self, data: dict[str, Any]) -> Session:
-        raw_status = data.get("status", "QUEUED")
+        raw_status = data.get("state", data.get("status", "QUEUED"))
         status = _STATUS_MAP.get(raw_status, "in_progress")
         artifacts: list[Artifact] = []
         for out in data.get("outputs", []):
@@ -104,12 +104,19 @@ class JulesV1AlphaProvider:
             repo_path = parts[0]
             branch = opts.source.branch or (parts[1] if len(parts) > 1 else None)
             owner, _, repo = repo_path.partition("/")
-            source_ctx: dict[str, Any] = {
-                "source": f"sources/github-{owner}-{repo}",
+            source_name = f"sources/github/{owner}/{repo}"
+            if not branch:
+                src_resp = await self._req("GET", f"/{source_name}")
+                src_data = src_resp.json()
+                branch = (
+                    src_data.get("githubRepo", {})
+                    .get("defaultBranch", {})
+                    .get("displayName")
+                )
+            body["sourceContext"] = {
+                "source": source_name,
+                "githubRepoContext": {"startingBranch": branch},
             }
-            if branch:
-                source_ctx["githubRepoContext"] = {"startingBranch": branch}
-            body["sourceContext"] = source_ctx
         if po.get("require_plan_approval"):
             body["requirePlanApproval"] = True
         automation = po.get("auto_create_pr")
@@ -143,7 +150,12 @@ class JulesV1AlphaProvider:
             params: dict[str, Any] = {"pageSize": 100}
             if cursor:
                 params["pageToken"] = cursor
-            resp = await self._req("GET", f"/sessions/{session_id}/activities", params=params)
+            try:
+                resp = await self._req("GET", f"/sessions/{session_id}/activities", params=params)
+            except ProviderError as exc:
+                if exc.kind == "not_found":
+                    return [], cursor
+                raise
             data = resp.json()
             activities = data.get("activities", [])
             next_token: Optional[str] = data.get("nextPageToken")
@@ -210,60 +222,59 @@ class JulesV1AlphaProvider:
 
 
 def _activity_to_event(act: dict[str, Any], session_id: str) -> Optional[Event]:
-    kind_raw = act.get("kind", "")
     ts_str = act.get("createTime", datetime.now(timezone.utc).isoformat())
     ts = _parse_dt(ts_str)
 
-    if kind_raw == "agentMessage":
+    if "agentMessaged" in act:
         return Event(
             kind="message",
             session_id=session_id,
             provider="jules",
             ts=ts,
             seq=0,
-            data={"text": act.get("agentMessage", {}).get("text", "")},
+            data={"text": act["agentMessaged"].get("agentMessage", "")},
             raw=act,
         )
-    if kind_raw == "progressUpdated":
-        tool = act.get("progressUpdated", {}).get("tool", "")
-        summary = act.get("progressUpdated", {}).get("summary", "")
-        if tool:
-            return Event(
-                kind="tool_activity",
-                session_id=session_id,
-                provider="jules",
-                ts=ts,
-                seq=0,
-                data={"tool": tool, "summary": summary},
-                raw=act,
-            )
-    if kind_raw == "planGenerated":
+    if "progressUpdated" in act:
+        tool = act["progressUpdated"].get("tool", "")
+        summary = act["progressUpdated"].get("summary", "")
+        return Event(
+            kind="tool_activity",
+            session_id=session_id,
+            provider="jules",
+            ts=ts,
+            seq=0,
+            data={"tool": tool, "summary": summary},
+            raw=act,
+        )
+    if "planGenerated" in act:
         return Event(
             kind="provider_event",
             session_id=session_id,
             provider="jules",
             ts=ts,
             seq=0,
-            data={"type": "plan_proposed", "steps": act.get("planGenerated", {}).get("steps", [])},
+            data={"type": "plan_proposed", "steps": act["planGenerated"].get("steps", [])},
             raw=act,
         )
-    if kind_raw == "userMessage":
+    if "userMessaged" in act:
         return Event(
             kind="provider_event",
             session_id=session_id,
             provider="jules",
             ts=ts,
             seq=0,
-            data={"type": "user_message", "text": act.get("userMessage", {}).get("text", "")},
+            data={"type": "user_message", "text": act["userMessaged"].get("userMessage", "")},
             raw=act,
         )
     # anything else → provider_event passthrough
+    act_type = next((k for k in act if k not in ("name", "createTime", "originator", "id")), "unknown")
     return Event(
         kind="provider_event",
         session_id=session_id,
         provider="jules",
         ts=ts,
         seq=0,
-        data={"type": kind_raw, "raw": act},
+        data={"type": act_type, "raw": act},
         raw=act,
     )

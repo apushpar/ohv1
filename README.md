@@ -18,13 +18,39 @@ npm install omniharness
 
 ## Quickstart
 
-### Python
+### Python (Jules)
 
 ```python
-from omniharness import OmniHarness, SessionOptions, Source
+import asyncio
+from omniharness import OmniHarness, Source
+from omniharness.types import SessionOptions
 
-client = OmniHarness()
+async def main():
+    client = OmniHarness()  # reads JULES_API_KEY from environment
 
+    session = await client.sessions.create(
+        provider="jules",
+        options=SessionOptions(
+            prompt="Add unit tests for the auth module",
+            source=Source.parse("github://owner/repo"),
+        ),
+    )
+
+    async for event in session.stream():
+        if event.kind == "message":
+            print(event.data["text"])
+        elif event.kind == "status":
+            print("done:", event.data["value"])
+            break
+
+asyncio.run(main())
+```
+
+> **Note:** pass the API key via `uv run --env-file .env` — `source .env` alone is not sufficient as `uv run` does not inherit shell-exported variables.
+
+### Python (Claude MA)
+
+```python
 session = await client.sessions.create(
     provider="claude",
     options=SessionOptions(
@@ -84,6 +110,10 @@ session = await client.sessions.get(
 await session.wait()
 ```
 
+## Provider guides
+
+- [Jules (Google)](docs/jules.md) — authentication, source setup, event types, plan approval
+
 ## Provider matrix
 
 | Provider | Python | TypeScript | Streaming | Plan Approval | Tool Results | File Upload |
@@ -123,8 +153,21 @@ await session.wait()
 ### Plan approval (Jules only)
 
 ```python
+# Create session with require_plan_approval to pause before execution
+session = await client.sessions.create(
+    provider="jules",
+    options=SessionOptions(
+        prompt="Refactor the auth module",
+        source=Source.parse("github://owner/repo@main"),
+        provider_options={"require_plan_approval": True},
+    ),
+)
+
 async for event in session.stream():
-    if event.kind == "requires_input":
+    if event.kind == "provider_event" and event.data.get("type") == "plan_proposed":
+        # Inspect the plan steps before approving
+        for step in event.raw["planGenerated"]["plan"].get("steps", []):
+            print(f"  - {step['title']}")
         await session.approve_plan()
     elif event.kind == "status":
         break
