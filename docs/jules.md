@@ -1,11 +1,11 @@
-# Jules (Google) — Python Adapter
+# Jules (Google) — Adapter Guide
 
-Jules is Google's managed coding agent. This document covers everything needed to use the Jules adapter in the OmniHarness Python SDK, including authentication, source setup, event types, and plan approval.
+Jules is Google's managed coding agent. This document covers everything needed to use the Jules adapter in the OmniHarness **Python** and **TypeScript** SDKs, including authentication, source setup, event types, and plan approval.
 
 ## Prerequisites
 
 1. **API key** — obtain a Jules API key from [jules.google.com](https://jules.google.com).
-2. **Connected GitHub repo** — Jules only works with repositories you have connected in the Jules dashboard. You can verify which repos are available:
+2. **Connected GitHub repo** — Jules only works with repositories you have connected in the Jules dashboard. Verify which repos are available:
 
 ```bash
 curl -H "x-goog-api-key: $JULES_API_KEY" \
@@ -14,26 +14,42 @@ curl -H "x-goog-api-key: $JULES_API_KEY" \
 
 ## Authentication
 
-Jules uses a static API key passed as `x-goog-api-key`. Store it in a `.env` file (never commit this):
+Jules uses a static API key sent as the `x-goog-api-key` header. Store it in a `.env` file (never commit this):
 
 ```
 # .env
 JULES_API_KEY=your_key_here
 ```
 
-Pass it to `uv run` via `--env-file` — `source .env` alone is not enough because `uv run` runs in an isolated environment that does not inherit shell-exported variables:
+**Python** — pass via `--env-file`; `source .env` alone is insufficient because `uv run` runs in an isolated environment that does not inherit shell-exported variables:
 
 ```bash
 uv run --project packages/python --env-file .env python your_script.py
 ```
 
-Alternatively, pass the key explicitly in code:
+**TypeScript** — set the variable before running:
+
+```bash
+JULES_API_KEY=your_key_here npx tsx your_script.ts
+# or export it:
+export JULES_API_KEY=your_key_here && npx tsx your_script.ts
+```
+
+Both SDKs also accept the key directly in code:
 
 ```python
+# Python
 client = OmniHarness(keys={"jules": "your_key_here"})
 ```
 
+```typescript
+// TypeScript
+const client = new OmniHarness({ providerKeys: { jules: "your_key_here" } });
+```
+
 ## Quickstart — end-to-end example
+
+### Python
 
 ```python
 import asyncio
@@ -56,7 +72,7 @@ async def main():
         if event.kind == "message":
             print(event.data["text"])
         elif event.kind == "tool_activity":
-            print(f"[{event.data['title']}]")
+            print(f"[{event.data.get('title', '')}]")
         elif event.kind == "status":
             print(f"Session {event.data['value']}")
             break
@@ -70,65 +86,142 @@ Run it:
 uv run --project packages/python --env-file .env python quickstart.py
 ```
 
+### TypeScript
+
+```typescript
+import { OmniHarness, parseSource } from "omniharness";
+
+const client = new OmniHarness();
+
+const session = await client.sessions.create("jules", {
+  prompt: "Summarize this codebase: what it does, its architecture, and key modules.",
+  source: parseSource("github://owner/repo"),
+  // branch is optional — if omitted, Jules uses the repo's default branch
+});
+
+for await (const event of session.stream()) {
+  if (event.kind === "message") {
+    console.log(event.data["text"]);
+  } else if (event.kind === "tool_activity") {
+    const title = (event.data["title"] as string) || "";
+    if (title) console.log(`[${title}]`);
+  } else if (event.kind === "status") {
+    console.log(`Session ${event.data["value"]}`);
+    break;
+  }
+}
+```
+
+Run it:
+
+```bash
+JULES_API_KEY=your_key npx tsx quickstart.ts
+```
+
 ## Source configuration
 
 The `source` argument tells Jules which repository to work on.
 
+**Python**
+
 ```python
+from omniharness import Source
+
 # Repo's default branch (adapter fetches it automatically)
-source=Source.parse("github://owner/repo")
+source = Source.parse("github://owner/repo")
 
 # Specific branch
-source=Source.parse("github://owner/repo@my-branch")
+source = Source.parse("github://owner/repo@my-branch")
 
-# Explicit object form
-from omniharness.types import Source
-source=Source(uri="github://owner/repo", kind="github", branch="my-branch")
+# Explicit object
+source = Source(uri="github://owner/repo", kind="github", branch="my-branch")
 ```
 
-Jules requires a branch on every request. When you omit one, the adapter calls `GET /v1alpha/sources/github/{owner}/{repo}` to resolve the default branch before creating the session.
+**TypeScript**
+
+```typescript
+import { parseSource } from "omniharness";
+
+// Repo's default branch (adapter fetches it automatically)
+const source = parseSource("github://owner/repo");
+
+// Specific branch
+const source = parseSource("github://owner/repo@my-branch");
+
+// Explicit object
+const source = { uri: "github://owner/repo", kind: "github" as const, branch: "my-branch" };
+```
+
+Jules requires a `startingBranch` on every session request. When you omit a branch, the adapter calls `GET /v1alpha/sources/github/{owner}/{repo}` to resolve the repo's default branch before creating the session.
 
 ## Event types
 
-All events are `Event` objects with `.kind`, `.data`, `.ts`, `.seq`, and `.raw` attributes. Jules emits these kinds in a typical session:
+All events carry `.kind`, `.data`, `.ts`, `.seq`, and `.raw`. Jules emits these in a typical session:
 
-| Kind | When emitted | Key data fields |
+| Kind | When emitted | Key `data` fields |
 |------|-------------|-----------------|
-| `provider_event` (type `"plan_proposed"`) | Jules proposes its execution plan | `data["steps"]` — list of step dicts; full plan in `event.raw["planGenerated"]["plan"]` |
-| `provider_event` (type `"planApproved"`) | Plan approved (auto or by user) | `event.raw["planApproved"]["planId"]` |
-| `message` | Agent sends a text response | `data["text"]` — the message string |
-| `tool_activity` | Agent completes a work step | `data["title"]` — step description; `event.raw["artifacts"]` — changesets |
-| `provider_event` (type `"sessionCompleted"`) | Jules signals it is done | `event.raw["artifacts"]` — final changeset with suggested commit message |
-| `provider_event` (type `"keep_alive"`) | SDK keepalive (no Jules activity for 30 s) | — |
-| `status` | Session reaches terminal state | `data["value"]` — `"completed"`, `"failed"`, or `"cancelled"` |
+| `provider_event` (`type: "plan_proposed"`) | Jules proposes its execution plan | `steps` — list of step objects; full plan in `raw.planGenerated.plan` |
+| `provider_event` (`type: "planApproved"`) | Plan approved (auto or by user) | `raw.planApproved.planId` |
+| `message` | Agent sends a text response | `text` — the message string |
+| `tool_activity` | Agent completes a work step | `title` — step description; `raw.artifacts` — changesets |
+| `provider_event` (`type: "sessionCompleted"`) | Jules signals it is done | `raw.artifacts` — final changeset with suggested commit message |
+| `provider_event` (`type: "keep_alive"`) | SDK keepalive (no Jules activity for 30 s) | — |
+| `status` | Session reaches a terminal state | `value` — `"completed"`, `"failed"`, or `"cancelled"` |
 
 ### Reading `tool_activity` events
 
 Jules `progressUpdated` activities carry a `title` in the raw payload, not `tool`/`summary`:
 
 ```python
+# Python
 elif event.kind == "tool_activity":
-    title = event.raw["progressUpdated"].get("title", "")
+    title = (event.raw or {}).get("progressUpdated", {}).get("title", "")
     print(f"Progress: {title}")
-    # check for changesets
-    for artifact in event.raw.get("artifacts", []):
-        cs = artifact.get("changeSet", {})
-        patch = cs.get("gitPatch", {})
+    for artifact in (event.raw or {}).get("artifacts", []):
+        patch = artifact.get("changeSet", {}).get("gitPatch", {})
         print(f"  base commit: {patch.get('baseCommitId')}")
 ```
 
-### Reading `provider_event` plan steps
+```typescript
+// TypeScript
+} else if (event.kind === "tool_activity") {
+  const raw = event.raw as Record<string, unknown>;
+  const pu = raw?.["progressUpdated"] as Record<string, unknown> | undefined;
+  console.log(`Progress: ${pu?.["title"] ?? ""}`);
+  for (const artifact of (raw?.["artifacts"] as unknown[] | undefined) ?? []) {
+    const cs = (artifact as Record<string, unknown>)["changeSet"] as Record<string, unknown> | undefined;
+    const patch = cs?.["gitPatch"] as Record<string, unknown> | undefined;
+    console.log(`  base commit: ${patch?.["baseCommitId"]}`);
+  }
+}
+```
+
+### Reading plan steps
 
 ```python
+# Python
 elif event.kind == "provider_event" and event.data.get("type") == "plan_proposed":
     plan = event.raw["planGenerated"]["plan"]
     for step in plan.get("steps", []):
         print(f"  - {step['title']}: {step.get('description', '')}")
 ```
 
+```typescript
+// TypeScript
+} else if (event.kind === "provider_event" && event.data["type"] === "plan_proposed") {
+  const raw = event.raw as Record<string, unknown>;
+  const plan = (raw?.["planGenerated"] as Record<string, unknown>)?.["plan"] as Record<string, unknown>;
+  for (const step of (plan?.["steps"] as Array<Record<string, unknown>>) ?? []) {
+    console.log(`  - ${step["title"]}: ${step["description"] ?? ""}`);
+  }
+}
+```
+
 ## Plan approval
 
-By default Jules auto-approves its own plan. To require explicit approval, set `require_plan_approval` in `provider_options`. The session transitions to `awaiting_input` state while waiting.
+By default Jules auto-approves its own plan. To require explicit approval, set `require_plan_approval` in `providerOptions`. The session transitions to `awaiting_input` while waiting.
+
+**Python**
 
 ```python
 session = await client.sessions.create(
@@ -145,7 +238,6 @@ async for event in session.stream():
         plan = event.raw["planGenerated"]["plan"]
         for step in plan.get("steps", []):
             print(f"  Step: {step['title']}")
-        # Approve after reviewing
         await session.approve_plan()
     elif event.kind == "message":
         print(event.data["text"])
@@ -154,9 +246,35 @@ async for event in session.stream():
         break
 ```
 
+**TypeScript**
+
+```typescript
+const session = await client.sessions.create("jules", {
+  prompt: "Refactor the auth module to use JWT",
+  source: parseSource("github://owner/repo@main"),
+  providerOptions: { require_plan_approval: true },
+});
+
+for await (const event of session.stream()) {
+  if (event.kind === "provider_event" && event.data["type"] === "plan_proposed") {
+    const raw = event.raw as Record<string, unknown>;
+    const plan = (raw?.["planGenerated"] as Record<string, unknown>)?.["plan"] as Record<string, unknown>;
+    for (const step of (plan?.["steps"] as Array<Record<string, unknown>>) ?? []) {
+      console.log(`  Step: ${step["title"]}`);
+    }
+    await session.approvePlan();
+  } else if (event.kind === "message") {
+    console.log(event.data["text"]);
+  } else if (event.kind === "status") {
+    console.log("Done:", event.data["value"]);
+    break;
+  }
+}
+```
+
 ## Auto PR mode
 
-To have Jules automatically create a pull request when it finishes:
+**Python**
 
 ```python
 options=SessionOptions(
@@ -166,14 +284,33 @@ options=SessionOptions(
 )
 ```
 
-The resulting PR URL appears as an `Artifact` on the session once completed:
+**TypeScript**
+
+```typescript
+const session = await client.sessions.create("jules", {
+  prompt: "...",
+  source: parseSource("github://owner/repo@main"),
+  providerOptions: { auto_create_pr: true },
+});
+```
+
+The resulting PR URL is available after the session completes:
 
 ```python
+# Python
 await session.wait()
 print(session.pull_request_url)
 ```
 
+```typescript
+// TypeScript
+await session.wait();
+console.log(session.pullRequestUrl);
+```
+
 ## Listing and reconnecting sessions
+
+**Python**
 
 ```python
 # List recent sessions
@@ -181,13 +318,62 @@ page = await client.sessions.list(provider="jules", limit=10)
 for s in page.sessions:
     print(s.id, s.status, s.created_at)
 
-# Reconnect to an existing session by ID
+# Reconnect by session ID
 session = await client.sessions.get(provider="jules", session_id="12345678901234567890")
 async for event in session.stream():
     ...
 ```
 
+**TypeScript**
+
+```typescript
+// List recent sessions
+const page = await client.sessions.list("jules", 10);
+for (const s of page.sessions) {
+  console.log(s.id, s.status, s.createdAt);
+}
+
+// Reconnect by session ID
+const session = await client.sessions.get("jules", "12345678901234567890");
+for await (const event of session.stream()) {
+  // ...
+}
+```
+
+## sendMessage
+
+Jules only accepts `sendMessage` when the session is in `IN_PROGRESS` state. Calling it while `QUEUED` returns a 404. Poll `refresh()` until `in_progress` before sending:
+
+**Python**
+
+```python
+import asyncio
+
+session = await client.sessions.create(...)
+# Poll until in_progress
+while session.status == "queued":
+    await asyncio.sleep(3)
+    session = await session.refresh()
+
+await session.send_message("Please also update the README.")
+```
+
+**TypeScript**
+
+```typescript
+let session = await client.sessions.create("jules", { ... });
+// Poll until in_progress
+while (session.status === "queued") {
+  await new Promise(r => setTimeout(r, 3000));
+  session = await session.refresh();
+}
+
+await session.sendMessage("Please also update the README.");
+```
+
 ## Error handling
+
+**Python**
 
 ```python
 from omniharness.errors import ProviderError
@@ -205,9 +391,30 @@ except ProviderError as e:
         print(f"Provider error ({e.kind}): {e}")
 ```
 
+**TypeScript**
+
+```typescript
+import { ProviderError } from "omniharness";
+
+try {
+  const session = await client.sessions.create("jules", { ... });
+} catch (err) {
+  if (err instanceof ProviderError) {
+    if (err.kind === "auth") console.error("Invalid or missing JULES_API_KEY");
+    else if (err.kind === "not_found") console.error("Repo not connected to Jules");
+    else if (err.kind === "rate_limit") console.error(`Rate limited, retry after ${err.retryAfter}s`);
+    else console.error(`Provider error (${err.kind}): ${err.message}`);
+  }
+}
+```
+
 ## Known Jules API behaviours
 
-- `GET /v1alpha/sessions/{id}/activities` returns **404** while the session is in `QUEUED` state (not yet started). The adapter handles this transparently by treating it as an empty activity list and continuing to poll.
-- The session object uses the field name **`state`** (not `status`) for the current state.
-- Activity type is indicated by **which field is present** in the activity object (`agentMessaged`, `progressUpdated`, `planGenerated`, etc.) — there is no explicit `kind` field.
-- The source name format Jules expects is `sources/github/{owner}/{repo}` (slash-separated), not `sources/github-{owner}-{repo}`.
+These quirks affect both the Python and TypeScript adapters, which handle them transparently:
+
+- **`GET /activities` returns 404 while QUEUED** — Jules does not expose the activities endpoint until the session starts executing. The adapter treats this as an empty list and keeps polling.
+- **Session field is `state`, not `status`** — the Jules API uses `state` on session objects; the adapter normalises it to `status` in the SDK types.
+- **Activity type detected by field presence** — Jules activities do not have a `kind` field; the type is determined by which payload field is present (`agentMessaged`, `progressUpdated`, `planGenerated`, `userMessaged`, etc.).
+- **Source name format** — Jules expects `sources/github/{owner}/{repo}` (slash-separated). The adapter constructs this automatically.
+- **`sendMessage` requires `IN_PROGRESS` state** — calling it while the session is `QUEUED` returns 404. See the `sendMessage` section above for the polling pattern.
+- **Cancelled sessions are deleted** — after `cancel()`, a `GET` on the session returns 404. The adapter surfaces this as a `ProviderError` with `kind: "not_found"`.
