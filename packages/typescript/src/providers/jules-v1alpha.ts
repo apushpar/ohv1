@@ -1,6 +1,6 @@
-import { classifyHttpError } from "../errors.js";
+import { ProviderError, classifyHttpError } from "../errors.js";
 import { pollingStream } from "../streaming.js";
-import type { Artifact, Event, ProviderId, ProviderCapabilities, ReplayToken, Session, SessionOptions, SessionPage, SessionStatus, Source } from "../types.js";
+import type { Artifact, Event, ProviderId, ProviderCapabilities, ReplayToken, Session, SessionOptions, SessionPage, SessionStatus } from "../types.js";
 import { ReplayToken as RT } from "../types.js";
 import type { SupportsPlanApproval } from "./extensions.js";
 
@@ -18,10 +18,6 @@ const STATUS_MAP: Record<string, SessionStatus> = {
   CANCELLED: "cancelled",
 };
 
-function parseDt(s: string): string {
-  return new Date(s).toISOString();
-}
-
 async function req(
   apiKey: string,
   method: string,
@@ -34,9 +30,9 @@ async function req(
       "X-Goog-Api-Key": apiKey,
       "Content-Type": "application/json",
     },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    body: body !== undefined ? JSON.stringify(body) : null,
   });
-  const data = resp.ok ? ((await resp.json()) as Record<string, unknown>) : {};
+  const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
   if (!resp.ok) {
     const hdrs: Record<string, string> = {};
     resp.headers.forEach((v, k) => { hdrs[k] = v; });
@@ -60,7 +56,10 @@ export class JulesV1AlphaProvider implements SupportsPlanApproval {
   constructor(private readonly apiKey: string) {}
 
   private toSession(data: Record<string, unknown>): Session {
-    const rawStatus = (data["status"] as string | undefined) ?? "QUEUED";
+    const rawStatus =
+      (data["state"] as string | undefined) ??
+      (data["status"] as string | undefined) ??
+      "QUEUED";
     const status: SessionStatus = STATUS_MAP[rawStatus] ?? "in_progress";
     const artifacts: Artifact[] = [];
     for (const out of (data["outputs"] as Array<Record<string, unknown>> | undefined) ?? []) {
@@ -69,19 +68,21 @@ export class JulesV1AlphaProvider implements SupportsPlanApproval {
         artifacts.push({
           kind: "pull_request",
           provider: "jules",
-          url: pr["url"] as string | undefined,
-          title: pr["title"] as string | undefined,
+          ...(pr["url"] !== undefined ? { url: pr["url"] as string } : {}),
+          ...(pr["title"] !== undefined ? { title: pr["title"] as string } : {}),
         });
       }
     }
     const nameStr = (data["name"] as string | undefined) ?? "";
-    const id = nameStr.includes("/") ? nameStr.split("/").pop()! : nameStr;
+    const id = nameStr.includes("/")
+      ? nameStr.split("/").pop()!
+      : (data["id"] as string | undefined) ?? nameStr;
     return {
       id,
       provider: "jules",
       status,
-      createdAt: parseDt((data["createTime"] as string | undefined) ?? new Date().toISOString()),
-      updatedAt: parseDt((data["updateTime"] as string | undefined) ?? new Date().toISOString()),
+      createdAt: new Date((data["createTime"] as string | undefined) ?? new Date().toISOString()).toISOString(),
+      updatedAt: new Date((data["updateTime"] as string | undefined) ?? new Date().toISOString()).toISOString(),
       artifacts,
       replayToken: RT._encode({}),
     };
@@ -91,17 +92,28 @@ export class JulesV1AlphaProvider implements SupportsPlanApproval {
     const po = opts.providerOptions ?? {};
     const body: Record<string, unknown> = { prompt: opts.prompt };
     if (opts.title) body["title"] = opts.title;
-    if (opts.source && (opts.source.kind === "github" || opts.source.kind === "gitlab" || opts.source.kind === "bitbucket")) {
+    if (
+      opts.source &&
+      (opts.source.kind === "github" || opts.source.kind === "gitlab" || opts.source.kind === "bitbucket")
+    ) {
       const rest = opts.source.uri.split("://")[1]!;
-      const [repoPart, branch] = rest.split("@", 2) as [string, string | undefined];
-      const [owner, , repo] = repoPart.split("/", 3) as [string, string, string];
-      const srcCtx: Record<string, unknown> = {
-        source: `sources/github-${owner}-${repo}`,
-      };
-      if (branch ?? opts.source.branch) {
-        srcCtx["githubRepoContext"] = { startingBranch: branch ?? opts.source.branch };
+      const [repoPart, uriB] = rest.split("@", 2) as [string, string | undefined];
+      const slashIdx = repoPart.indexOf("/");
+      const owner = repoPart.slice(0, slashIdx);
+      const repo = repoPart.slice(slashIdx + 1);
+      const sourceName = `sources/github/${owner}/${repo}`;
+      let branch: string | undefined = opts.source.branch ?? uriB;
+      if (!branch) {
+        // Jules requires startingBranch on every request — fetch the default
+        const srcData = await req(this.apiKey, "GET", `/${sourceName}`);
+        const githubRepo = srcData["githubRepo"] as Record<string, unknown> | undefined;
+        const defaultBranch = githubRepo?.["defaultBranch"] as Record<string, unknown> | undefined;
+        branch = defaultBranch?.["displayName"] as string | undefined;
       }
-      body["sourceContext"] = srcCtx;
+      body["sourceContext"] = {
+        source: sourceName,
+        githubRepoContext: { startingBranch: branch },
+      };
     }
     if (po["require_plan_approval"]) body["requirePlanApproval"] = true;
     if (po["auto_create_pr"]) body["automationMode"] = "AUTO_CREATE_PR";
@@ -129,7 +141,16 @@ export class JulesV1AlphaProvider implements SupportsPlanApproval {
     ): Promise<[Event[], string | undefined]> => {
       const params = new URLSearchParams({ pageSize: "100" });
       if (cursor) params.set("pageToken", cursor);
-      const data = await req(apiKey, "GET", `/sessions/${sessionId}/activities?${params}`);
+      let data: Record<string, unknown>;
+      try {
+        data = await req(apiKey, "GET", `/sessions/${sessionId}/activities?${params}`);
+      } catch (err) {
+        // Jules returns 404 on /activities while session is still QUEUED
+        if (err instanceof ProviderError && err.kind === "not_found") {
+          return [[], cursor];
+        }
+        throw err;
+      }
       const activities = (data["activities"] as Array<Record<string, unknown>> | undefined) ?? [];
       const nextToken = data["nextPageToken"] as string | undefined;
       const events: Event[] = [];
@@ -165,10 +186,15 @@ export class JulesV1AlphaProvider implements SupportsPlanApproval {
     const params = new URLSearchParams({ pageSize: String(limit) });
     if (cursor) params.set("pageToken", cursor);
     const data = await req(this.apiKey, "GET", `/sessions?${params}`);
-    const sessions = ((data["sessions"] as Array<Record<string, unknown>> | undefined) ?? []).map(
-      (s) => this.toSession(s),
-    );
-    return { sessions, nextCursor: data["nextPageToken"] as string | undefined, provider: "jules" };
+    const sessions = (
+      (data["sessions"] as Array<Record<string, unknown>> | undefined) ?? []
+    ).map((s) => this.toSession(s));
+    const nextCursor = data["nextPageToken"] as string | undefined;
+    return {
+      sessions,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+      provider: "jules",
+    };
   }
 
   async approvePlan(sessionId: string, _replayToken?: ReplayToken): Promise<void> {
@@ -177,37 +203,41 @@ export class JulesV1AlphaProvider implements SupportsPlanApproval {
 }
 
 function activityToEvent(act: Record<string, unknown>, sessionId: string): Event | null {
-  const kindRaw = (act["kind"] as string | undefined) ?? "";
   const tsStr = (act["createTime"] as string | undefined) ?? new Date().toISOString();
   const ts = new Date(tsStr).toISOString();
 
-  if (kindRaw === "agentMessage") {
+  // Activity type is indicated by which field is present — there is no "kind" field.
+  if ("agentMessaged" in act) {
+    const am = act["agentMessaged"] as Record<string, unknown> | undefined;
     return {
       kind: "message",
       sessionId,
       provider: "jules",
       ts,
       seq: 0,
-      data: { text: (act["agentMessage"] as Record<string, unknown> | undefined)?.["text"] ?? "" },
+      data: { text: (am?.["agentMessage"] as string | undefined) ?? "" },
       raw: act,
     };
   }
-  if (kindRaw === "progressUpdated") {
+  if ("progressUpdated" in act) {
     const pu = act["progressUpdated"] as Record<string, unknown> | undefined;
-    const tool = (pu?.["tool"] as string | undefined) ?? "";
-    if (tool) {
-      return {
-        kind: "tool_activity",
-        sessionId,
-        provider: "jules",
-        ts,
-        seq: 0,
-        data: { tool, summary: (pu?.["summary"] as string | undefined) ?? "" },
-        raw: act,
-      };
-    }
+    return {
+      kind: "tool_activity",
+      sessionId,
+      provider: "jules",
+      ts,
+      seq: 0,
+      data: {
+        tool: (pu?.["tool"] as string | undefined) ?? "",
+        summary: (pu?.["summary"] as string | undefined) ?? "",
+        title: (pu?.["title"] as string | undefined) ?? "",
+      },
+      raw: act,
+    };
   }
-  if (kindRaw === "planGenerated") {
+  if ("planGenerated" in act) {
+    const pg = act["planGenerated"] as Record<string, unknown> | undefined;
+    const plan = pg?.["plan"] as Record<string, unknown> | undefined;
     return {
       kind: "provider_event",
       sessionId,
@@ -216,12 +246,13 @@ function activityToEvent(act: Record<string, unknown>, sessionId: string): Event
       seq: 0,
       data: {
         type: "plan_proposed",
-        steps: (act["planGenerated"] as Record<string, unknown> | undefined)?.["steps"] ?? [],
+        steps: (plan?.["steps"] as unknown[] | undefined) ?? [],
       },
       raw: act,
     };
   }
-  if (kindRaw === "userMessage") {
+  if ("userMessaged" in act) {
+    const um = act["userMessaged"] as Record<string, unknown> | undefined;
     return {
       kind: "provider_event",
       sessionId,
@@ -230,18 +261,23 @@ function activityToEvent(act: Record<string, unknown>, sessionId: string): Event
       seq: 0,
       data: {
         type: "user_message",
-        text: (act["userMessage"] as Record<string, unknown> | undefined)?.["text"] ?? "",
+        text: (um?.["userMessage"] as string | undefined) ?? "",
       },
       raw: act,
     };
   }
+  // passthrough for planApproved, sessionCompleted, and anything else
+  const actType =
+    Object.keys(act).find(
+      (k) => !["name", "createTime", "originator", "id", "artifacts"].includes(k),
+    ) ?? "unknown";
   return {
     kind: "provider_event",
     sessionId,
     provider: "jules",
     ts,
     seq: 0,
-    data: { type: kindRaw, raw: act },
+    data: { type: actType, raw: act },
     raw: act,
   };
 }
